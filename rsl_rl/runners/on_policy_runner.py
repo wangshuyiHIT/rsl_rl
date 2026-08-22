@@ -47,7 +47,14 @@ class OnPolicyRunner:
         self.alg = self._construct_algorithm(obs)
 
         # Create the logger
-        self.logger = Logger(
+        self.logger = self._construct_logger(log_dir)
+
+        self.current_learning_iteration = 0
+
+    def _construct_logger(self, log_dir: str | None) -> Logger:
+        """Create the runner logger once, allowing specialized subclasses."""
+
+        return Logger(
             log_dir=log_dir,
             cfg=self.cfg,
             env_cfg=self.env.cfg,
@@ -57,8 +64,6 @@ class OnPolicyRunner:
             gpu_global_rank=self.gpu_global_rank,
             device=self.device,
         )
-
-        self.current_learning_iteration = 0
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
@@ -80,6 +85,11 @@ class OnPolicyRunner:
         start_it = self.current_learning_iteration
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
+            # Optional per-iteration hook (Scaler in-process DR ramp, etc.).
+            callback = getattr(self, "iteration_callback", None)
+            if callback is not None:
+                callback(self, it)
+
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -109,7 +119,9 @@ class OnPolicyRunner:
 
             stop = time.time()
             learn_time = stop - start
-            self.current_learning_iteration = it
+            # ``it`` is the 0-based update index; completed-count is it+1 so a
+            # chunk of N updates from 0 ends at model_N (not model_{N-1}).
+            self.current_learning_iteration = it + 1
 
             # Log information
             self.logger.log(
@@ -122,11 +134,15 @@ class OnPolicyRunner:
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.policy.action_std,
                 rnd_weight=self.alg.rnd.weight if self.alg_cfg["rnd_cfg"] else None,
+                print_minimal=bool(self.cfg.get("print_minimal", False)),
             )
 
             # Save model (rank 0 only in distributed mode)
-            if it % self.cfg["save_interval"] == 0 and not self.logger.disable_logs:
-                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
+            if (
+                self.current_learning_iteration % self.cfg["save_interval"] == 0
+                and not self.logger.disable_logs
+            ):
+                self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
 
         # Save the final model after training
         if self.logger.log_dir is not None and not self.logger.disable_logs:

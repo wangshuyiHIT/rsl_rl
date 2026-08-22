@@ -125,6 +125,10 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
         self.enable_aux_loss = enable_aux_loss
         self.aux_loss_coef = aux_loss_coef
+        # Optional frozen-policy anchor, installed by the Scaler fine-tuning
+        # entry point after a reference checkpoint is loaded.
+        self.reference_policy = None
+        self.reference_policy_anchor_coef = 0.0
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         if self.policy.is_recurrent:
@@ -202,6 +206,9 @@ class PPO:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
         mean_aux_loss = 0 if self.enable_aux_loss else None
+        mean_reference_policy_anchor_loss = (
+            0 if self.reference_policy is not None else None
+        )
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -257,6 +264,21 @@ class PPO:
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
+            if self.reference_policy is not None:
+                with torch.inference_mode():
+                    self.reference_policy.act(
+                        obs_batch,
+                        masks=masks_batch,
+                        hidden_state=hidden_states_batch[0],
+                    )
+                    reference_mean = (
+                        self.reference_policy.action_mean.detach()
+                    )
+                reference_policy_anchor_loss = torch.mean(
+                    torch.square(
+                        self.policy.action_mean - reference_mean
+                    )
+                )
 
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -314,6 +336,11 @@ class PPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            if self.reference_policy is not None:
+                loss += (
+                    self.reference_policy_anchor_coef
+                    * reference_policy_anchor_loss
+                )
 
             # Auxiliary loss
             if self.enable_aux_loss:
@@ -400,6 +427,10 @@ class PPO:
                 mean_symmetry_loss += symmetry_loss.item()
             if mean_aux_loss is not None:
                 mean_aux_loss += aux_loss.item()
+            if mean_reference_policy_anchor_loss is not None:
+                mean_reference_policy_anchor_loss += (
+                    reference_policy_anchor_loss.item()
+                )
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -412,6 +443,8 @@ class PPO:
             mean_symmetry_loss /= num_updates
         if mean_aux_loss is not None:
             mean_aux_loss /= num_updates
+        if mean_reference_policy_anchor_loss is not None:
+            mean_reference_policy_anchor_loss /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -428,6 +461,10 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if self.enable_aux_loss:
             loss_dict["auxiliary"] = mean_aux_loss
+        if mean_reference_policy_anchor_loss is not None:
+            loss_dict["reference_policy_anchor"] = (
+                mean_reference_policy_anchor_loss
+            )
 
         return loss_dict
 

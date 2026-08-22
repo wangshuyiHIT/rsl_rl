@@ -123,6 +123,15 @@ class PPOAMP(PPO):
         disc_demo_obs = self.amp_discriminator.get_disc_demo_obs(obs, flatten_history_dim=False)
         # Compute the Style Reward
         self.style_rewards, self.disc_score = self.amp_discriminator.predict_style_reward(disc_obs, dt=self.amp_cfg["step_dt"])
+        # Optional per-env style gate published by the env as an observation
+        # group named "style_gate" (shape (num_envs, 1), values in [0, 1]).
+        # E.g. Scaler-AMP-3 zeroes the style reward on standing commands so
+        # holding the default pose is governed by task rewards alone.
+        if "style_gate" in obs.keys():
+            self.style_rewards = self.style_rewards * obs["style_gate"].reshape(-1)
+            if not getattr(self, "_style_gate_announced", False):
+                print("[PPOAMP] per-env style gate enabled (obs group 'style_gate')")
+                self._style_gate_announced = True
         # Linearly interpolate between task reward and style reward
         self.rewards_lerp = self.amp_discriminator.lerp_reward(task_reward=rewards, style_reward=self.style_rewards)
         # Store the un-normalized disc obs and disc demo obs into buffers

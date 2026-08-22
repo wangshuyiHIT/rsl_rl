@@ -35,8 +35,12 @@ class AMPRunner(OnPolicyRunner):
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         super().__init__(env, train_cfg, log_dir, device)
-        
-        self.logger = LoggerAMP(
+
+    def _construct_logger(self, log_dir: str | None) -> Logger:
+        # Scaler port: OnPolicyRunner builds its logger through this hook, so
+        # returning LoggerAMP here avoids the double W&B initialization that
+        # upstream's post-super() reassignment caused.
+        return LoggerAMP(
             log_dir=log_dir,
             cfg=self.cfg,
             env_cfg=self.env.cfg,
@@ -150,9 +154,17 @@ class AMPRunner(OnPolicyRunner):
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
-        # Load RND model if used
+        # Load RND model if used.  Checkpoints written before RND was
+        # enabled carry no RND weights; keep the fresh module so old
+        # models stay loadable (e.g. for play/eval comparisons).
         if self.alg_cfg["rnd_cfg"]:
-            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+            if "rnd_state_dict" in loaded_dict:
+                self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+            else:
+                warnings.warn(
+                    f"checkpoint {path} has no 'rnd_state_dict'; keeping the freshly "
+                    "initialized RND module."
+                )
         # Load AMP model
         self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
         self.alg.amp_discriminator.disc_obs_normalizer.load_state_dict(loaded_dict["amp_discriminator_normalizer_state_dict"])
@@ -161,7 +173,7 @@ class AMPRunner(OnPolicyRunner):
             # Algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             # RND optimizer if used
-            if self.alg_cfg["rnd_cfg"]:
+            if self.alg_cfg["rnd_cfg"] and "rnd_optimizer_state_dict" in loaded_dict:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
             # AMP discriminator optimizer
             self.alg.disc_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])

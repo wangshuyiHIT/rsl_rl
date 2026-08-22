@@ -8,6 +8,7 @@ from __future__ import annotations
 import git
 import os
 import pathlib
+import shutil
 import statistics
 import time
 import torch
@@ -102,6 +103,17 @@ class Logger:
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
 
+    def close(self) -> None:
+        """Flush local events and finish any external logging run."""
+
+        if self.writer is None:
+            return
+        self.writer.flush()
+        self.writer.close()
+        stop = getattr(self.writer, "stop", None)
+        if stop is not None:
+            stop()
+
     def log(
         self,
         it: int,
@@ -181,51 +193,120 @@ class Logger:
                 #     )
 
             # Print to console
-            log_string = f"""{"#" * width}\n"""
-            log_string += f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n\n"""
-
-            # Print run name if provided
-            run_name = self.cfg.get("run_name")
-            log_string += f"""{"Run name:":>{pad}} {run_name}\n""" if run_name else ""
-
-            # Print performance
-            log_string += (
-                f"""{"Total steps:":>{pad}} {self.tot_timesteps} \n"""
-                f"""{"Steps per second:":>{pad}} {fps:.0f} \n"""
-                f"""{"Collection time:":>{pad}} {collect_time:.3f}s \n"""
-                f"""{"Learning time:":>{pad}} {learn_time:.3f}s \n"""
-            )
-
-            # Print losses
-            for key, value in loss_dict.items():
-                log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
-
-            # Print rewards and episode length
-            if len(self.rewbuffer) > 0:
-                if self.cfg["algorithm"]["rnd_cfg"]:
-                    log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
-                    log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
-                log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
-                log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
-
-            # Print noise std
-            log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""
-
-            # Print episode extras
-            if not print_minimal:
-                log_string += extras_string
-
-            # Print footer
             done_it = it + 1 - start_it
             remaining_it = total_it - start_it - done_it
             eta = self.tot_time / done_it * remaining_it
-            log_string += (
-                f"""{"-" * width}\n"""
-                f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-                f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-                f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
-            )
-            print(log_string)
+            if print_minimal:
+                # Colon-aligned rows; bars span the full content width.
+                rows: list[tuple[str, str]] = [
+                    ("Total steps", f"{self.tot_timesteps}"),
+                    ("Steps per second", f"{fps:.0f}"),
+                ]
+                if len(self.rewbuffer) > 0:
+                    if self.cfg["algorithm"]["rnd_cfg"]:
+                        rows.append(
+                            (
+                                "Mean extrinsic reward",
+                                f"{statistics.mean(self.erewbuffer):.2f}",
+                            )
+                        )
+                        rows.append(
+                            (
+                                "Mean intrinsic reward",
+                                f"{statistics.mean(self.irewbuffer):.2f}",
+                            )
+                        )
+                    rows.append(
+                        ("Mean reward", f"{statistics.mean(self.rewbuffer):.2f}")
+                    )
+                    rows.append(
+                        (
+                            "Mean episode length",
+                            f"{statistics.mean(self.lenbuffer):.2f}",
+                        )
+                    )
+                timing_rows: list[tuple[str, str]] = [
+                    ("Iteration time", f"{iteration_time:.2f}s"),
+                    (
+                        "Time elapsed",
+                        time.strftime("%H:%M:%S", time.gmtime(self.tot_time)),
+                    ),
+                    ("ETA", time.strftime("%H:%M:%S", time.gmtime(eta))),
+                ]
+                run_name = self.cfg.get("run_name")
+                if run_name:
+                    rows.insert(0, ("Run name", str(run_name)))
+
+                label_w = max(len(label) for label, _ in (*rows, *timing_rows))
+                metric_lines = [f"{label:>{label_w}}: {value}" for label, value in rows]
+                timing_lines = [
+                    f"{label:>{label_w}}: {value}" for label, value in timing_rows
+                ]
+                header = f"Learning iteration {it}/{total_it}"
+                width = max(
+                    len(header),
+                    max(len(line) for line in metric_lines),
+                    max(len(line) for line in timing_lines),
+                )
+                metric_lines = [line.ljust(width) for line in metric_lines]
+                timing_lines = [line.ljust(width) for line in timing_lines]
+                # Bars extend 5 columns past the text block for a cleaner frame.
+                bar_w = width + 5
+                header_line = header.center(bar_w)
+                metric_lines = [line.ljust(bar_w) for line in metric_lines]
+                timing_lines = [line.ljust(bar_w) for line in timing_lines]
+
+                lines = [
+                    "=" * bar_w,
+                    f"\033[1m{header_line}\033[0m",
+                    "",
+                    *metric_lines,
+                    "",
+                    "-" * bar_w,
+                    *timing_lines,
+                ]
+                term_w = shutil.get_terminal_size(fallback=(80, 24)).columns
+                indent = " " * max(0, (term_w - bar_w) // 2)
+                print("\n".join(f"{indent}{line}" for line in lines))
+            else:
+                log_string = f"""{"#" * width}\n"""
+                log_string += f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n\n"""
+
+                # Print run name if provided
+                run_name = self.cfg.get("run_name")
+                log_string += f"""{"Run name:":>{pad}} {run_name}\n""" if run_name else ""
+
+                # Print performance
+                log_string += (
+                    f"""{"Total steps:":>{pad}} {self.tot_timesteps} \n"""
+                    f"""{"Steps per second:":>{pad}} {fps:.0f} \n"""
+                    f"""{"Collection time:":>{pad}} {collect_time:.3f}s \n"""
+                    f"""{"Learning time:":>{pad}} {learn_time:.3f}s \n"""
+                )
+                # Print losses
+                for key, value in loss_dict.items():
+                    log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+
+                # Print rewards and episode length
+                if len(self.rewbuffer) > 0:
+                    if self.cfg["algorithm"]["rnd_cfg"]:
+                        log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
+                        log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
+                    log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
+                    log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
+
+                # Print noise std
+                log_string += f"""{"Mean action noise std:":>{pad}} {action_std.mean().item():.2f}\n"""
+                # Print episode extras (per-term rewards, curriculum, metrics)
+                log_string += extras_string
+
+                log_string += (
+                    f"""{"-" * width}\n"""
+                    f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
+                    f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+                    f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
+                )
+                print(log_string)
 
             # Clear extras buffer
             self.ep_extras.clear()

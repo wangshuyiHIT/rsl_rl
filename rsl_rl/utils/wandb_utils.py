@@ -36,16 +36,35 @@ class WandbSummaryWriter(SummaryWriter):
 
         # Initialize wandb
         wandb.init(project=project, entity=entity, name=run_name)
-        wandb.config.update({"log_dir": log_dir})
+        self._allow_config_change = bool(
+            cfg.get("resume", False) or os.environ.get("WANDB_RESUME")
+        )
+        wandb.config.update(
+            {"log_dir": log_dir},
+            allow_val_change=self._allow_config_change,
+        )
+        self._wandb_step: int | None = None
+        self._wandb_scalars: dict[str, float] = {}
 
     def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
-        wandb.config.update({"runner_cfg": train_cfg})
-        wandb.config.update({"policy_cfg": train_cfg["policy"]})
-        wandb.config.update({"alg_cfg": train_cfg["algorithm"]})
+        update_kwargs = {
+            "allow_val_change": self._allow_config_change,
+        }
+        wandb.config.update({"runner_cfg": train_cfg}, **update_kwargs)
+        wandb.config.update(
+            {"policy_cfg": train_cfg["policy"]}, **update_kwargs
+        )
+        wandb.config.update(
+            {"alg_cfg": train_cfg["algorithm"]}, **update_kwargs
+        )
         try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})
+            wandb.config.update(
+                {"env_cfg": env_cfg.to_dict()}, **update_kwargs
+            )
         except Exception:
-            wandb.config.update({"env_cfg": asdict(env_cfg)})
+            wandb.config.update(
+                {"env_cfg": asdict(env_cfg)}, **update_kwargs
+            )
 
     def add_scalar(
         self,
@@ -62,9 +81,23 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        wandb.log({tag: scalar_value}, step=global_step)
+        if self._wandb_step is not None and global_step != self._wandb_step:
+            self._flush_wandb_scalars()
+        self._wandb_step = global_step
+        self._wandb_scalars[tag] = scalar_value
+
+    def _flush_wandb_scalars(self) -> None:
+        if not self._wandb_scalars:
+            return
+        wandb.log(self._wandb_scalars, step=self._wandb_step)
+        self._wandb_scalars = {}
+
+    def flush(self) -> None:
+        super().flush()
+        self._flush_wandb_scalars()
 
     def stop(self) -> None:
+        self._flush_wandb_scalars()
         wandb.finish()
 
     def save_model(self, model_path: str, it: int) -> None:
