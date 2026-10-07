@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import math
+from collections.abc import Mapping
 from itertools import chain
 from tensordict import TensorDict
 
@@ -111,29 +113,296 @@ class PPOAMP(PPO):
             lr=self.amp_cfg["disc_learning_rate"],
         )
         self.disc_max_grad_norm = self.amp_cfg.get("disc_max_grad_norm", 0.5)
+        if not math.isfinite(self.disc_max_grad_norm) or self.disc_max_grad_norm <= 0:
+            raise ValueError("disc_max_grad_norm must be finite and positive")
         
         # Storage for AMP discriminator observations
         self.disc_obs_buffer: CircularBuffer = disc_obs_buffer
         self.disc_demo_obs_buffer: CircularBuffer = disc_demo_obs_buffer
-        
+        self.lateral_reference_policy = None
+        self.lateral_rehearsal = None
+
+    def _lateral_rehearsal_loss(self) -> torch.Tensor | None:
+        rehearsal = getattr(self, "lateral_rehearsal", None)
+        return None if rehearsal is None else rehearsal.loss(self.policy)
+
+    def _reference_policy_anchor_loss(
+        self,
+        obs: TensorDict,
+        student_mean: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Keep AMP-2 gait near nominal while allowing morphology adaptation.
+
+        AMP-3's actor observation is ten frame-major 86-D frames, with the
+        five morphology features at the end of every frame.  The frozen AMP-2
+        teacher sees those slots as nominal zero by default; a morphology-aware
+        Flat teacher opts in to preserving them. A Gaussian morphology
+        weight makes the constraint strongest at nominal geometry and weaker
+        toward compact/extended robots, where PPO needs freedom to compensate
+        for changed dynamics. Canonical Flat-to-AMP tuning may additionally
+        exclude lateral commands using an explicit threshold; older tasks
+        retain all command families when that option is absent.
+        """
+
+        reference = getattr(self, "reference_policy", None)
+        coefficient = float(
+            getattr(self, "reference_policy_anchor_coef", 0.0)
+        )
+        if reference is None or coefficient <= 0.0:
+            return None
+
+        actor_obs = self.policy.get_actor_obs(obs)
+        if actor_obs.shape[-1] % 10 != 0:
+            raise ValueError(
+                "AMP-3 reference anchor requires ten frame-major observations, "
+                f"got width {actor_obs.shape[-1]}"
+            )
+        frame_width = actor_obs.shape[-1] // 10
+        if frame_width < 5:
+            raise ValueError(
+                f"AMP-3 reference anchor frame is too small: {frame_width}"
+            )
+        morphology_indices = torch.cat(
+            [
+                torch.arange(
+                    frame * frame_width + frame_width - 5,
+                    frame * frame_width + frame_width,
+                    device=actor_obs.device,
+                )
+                for frame in range(10)
+            ]
+        )
+
+        teacher_obs = actor_obs.detach().clone()
+        if not getattr(self, "reference_policy_preserve_morphology", False):
+            teacher_obs[..., morphology_indices] = 0.0
+        with torch.no_grad():
+            normalized_teacher_obs = reference.actor_obs_normalizer(
+                teacher_obs
+            )
+            teacher_mean = reference.actor(normalized_teacher_obs)
+
+        # Morphology is constant across the history, so the latest five slots
+        # are sufficient for proximity weighting.
+        morphology = actor_obs[..., -5:].detach()
+        radius = float(
+            getattr(self, "reference_policy_anchor_radius", 0.35)
+        )
+        floor = float(
+            getattr(self, "reference_policy_anchor_floor", 0.05)
+        )
+        if radius <= 0.0 or not 0.0 <= floor <= 1.0:
+            raise ValueError(
+                "reference anchor requires radius > 0 and floor in [0, 1]"
+            )
+        proximity = torch.exp(
+            -torch.mean(torch.square(morphology), dim=-1)
+            / (2.0 * radius * radius)
+        )
+        weight = floor + (1.0 - floor) * proximity
+        # Canonical Flat-to-AMP tuning may explicitly release a command family
+        # the frozen teacher cannot execute.  Default None leaves historical
+        # AMP anchors unchanged. Use the latest RAW frame, before the teacher's
+        # normalizer; older frames can contain a preceding command.
+        lateral_threshold = getattr(
+            self, "reference_policy_anchor_exclude_lateral_threshold", None
+        )
+        if lateral_threshold is not None:
+            lateral_threshold = float(lateral_threshold)
+            if not math.isfinite(lateral_threshold) or lateral_threshold < 0.0:
+                raise ValueError("reference anchor lateral threshold must be finite and non-negative")
+            if frame_width < 9:
+                raise ValueError("reference anchor lateral exclusion requires a 3-D command at frame slots 6:9")
+            latest_command_y = actor_obs[..., -frame_width + 7].detach()
+            weight = weight * (latest_command_y.abs() <= lateral_threshold)
+        action_error = torch.mean(
+            torch.square(student_mean - teacher_mean), dim=-1
+        )
+        return coefficient * torch.sum(weight * action_error) / torch.clamp(
+            torch.sum(weight), min=1.0
+        )
+
+    def _lateral_reference_policy_anchor_loss(
+        self, obs: TensorDict, student_mean: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Retain a frozen current-axis gait on pure lateral and optional backward commands.
+
+        Use the primary anchor's morphology band weighting and action-mean MSE,
+        preserving all actual morphology inputs. Only the latest raw command
+        selects rows, including when a minibatch contains mirrored observations.
+        """
+        reference = getattr(self, "lateral_reference_policy", None)
+        if reference is None:
+            return None
+        coefficient = float(self.lateral_reference_policy_anchor_coef)
+        radius = float(self.lateral_reference_policy_anchor_radius)
+        floor = float(self.lateral_reference_policy_anchor_floor)
+        threshold = float(self.lateral_reference_policy_command_threshold)
+        include_backward = getattr(self, "lateral_reference_policy_include_backward", False)
+        if type(include_backward) is not bool:
+            raise ValueError("Lateral reference include_backward must be a bool")
+        if (not all(math.isfinite(value) for value in (coefficient, radius, floor, threshold))
+                or coefficient <= 0 or radius <= 0 or not 0 <= floor <= 1 or threshold <= 0):
+            raise ValueError("Invalid lateral reference policy anchor configuration")
+        actor_obs = self.policy.get_actor_obs(obs)
+        if actor_obs.ndim != 2 or actor_obs.shape[1] != 860 or student_mean.shape != (actor_obs.shape[0], 24):
+            raise ValueError("Lateral reference policy requires raw 10x86 observations and 24 action means")
+        command = actor_obs[:, -86 + 6:-86 + 9].detach()
+        active = ((command[:, 1].abs() > threshold)
+                  & (command[:, 0].abs() < threshold)
+                  & (command[:, 2].abs() < threshold))
+        if include_backward:
+            active = active | ((command[:, 0] < -threshold)
+                               & (command[:, 1].abs() < threshold)
+                               & (command[:, 2].abs() < threshold))
+        # Slicing before the loss also guarantees zero gradient on unselected
+        # rows; an inactive batch still returns a differentiable exact zero.
+        if not active.any():
+            return student_mean[active].sum() * 0.0
+        teacher_obs = actor_obs[active].detach().clone()
+        with torch.no_grad():
+            teacher_mean = reference.actor(reference.actor_obs_normalizer(teacher_obs))
+        morphology = teacher_obs[:, -5:]
+        proximity = torch.exp(-torch.mean(torch.square(morphology), dim=-1) / (2.0 * radius * radius))
+        weight = floor + (1.0 - floor) * proximity
+        error = torch.mean(torch.square(student_mean[active] - teacher_mean), dim=-1)
+        return coefficient * torch.sum(weight * error) / torch.clamp(torch.sum(weight), min=1.0)
+
+    def _reward_time_amp_obs(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
+    ) -> TensorDict:
+        """Validate the canonical full-batch snapshot without falling back to next-state inputs."""
+        key = "amp_reward_observations"
+        if "task_style_gate" not in obs:
+            if key in extras:
+                raise ValueError("AMP reward snapshot requires the task_style_gate observation group")
+            return obs
+        snapshot = extras.get(key)
+        if not isinstance(snapshot, Mapping) or set(snapshot) != {"observations", "done_env_ids"}:
+            raise ValueError("Canonical AMP requires a complete reward-time observation snapshot")
+        count = rewards.numel()
+        if obs.batch_size != torch.Size([count]) or dones.numel() != count:
+            raise ValueError("AMP reward snapshot batch must match rewards, dones, and observations")
+        if not torch.isfinite(dones).all() or not ((dones == 0) | (dones == 1)).all():
+            raise ValueError("AMP reward snapshot dones must be finite binary values")
+        groups = snapshot["observations"]
+        required = {"disc", "disc_demo", "style_gate", "task_style_gate"}
+        if not isinstance(groups, Mapping) or set(groups) != required:
+            raise ValueError("AMP reward snapshot requires disc, disc_demo, style_gate, and task_style_gate")
+        disc_shape = (count, self.amp_cfg["disc_obs_steps"], self.amp_cfg["disc_obs_dim"])
+        for name in required:
+            value = groups[name]
+            shape = disc_shape if name in ("disc", "disc_demo") else (count, 1)
+            if (not isinstance(value, torch.Tensor) or value.shape != shape
+                    or not value.is_floating_point() or not torch.isfinite(value).all()):
+                raise ValueError(f"AMP reward snapshot {name} must be finite floating point with shape {shape}")
+        done_ids = dones.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        ids = snapshot["done_env_ids"]
+        if (not isinstance(ids, torch.Tensor) or ids.ndim != 1 or ids.dtype != torch.long
+                or not torch.equal(ids, done_ids.to(ids.device))):
+            raise ValueError("AMP reward snapshot done_env_ids must match done environments exactly")
+        terminal = extras.get("amp_terminal_observations")
+        if ids.numel():
+            if (not isinstance(terminal, Mapping) or set(terminal) != {"env_ids", "observations"}
+                    or not isinstance(terminal["env_ids"], torch.Tensor)):
+                raise ValueError("AMP terminal observations must be the reward snapshot's done subset")
+            terminal_ids = terminal["env_ids"]
+            if (terminal_ids.dtype != torch.long or terminal_ids.ndim != 1
+                    or not torch.equal(terminal_ids, ids.to(terminal_ids.device))):
+                raise ValueError("AMP terminal env_ids must equal reward snapshot done_env_ids")
+            terminal_groups = terminal["observations"]
+            if not isinstance(terminal_groups, Mapping) or set(terminal_groups) != required:
+                raise ValueError("AMP terminal observations require all four reward snapshot groups")
+            for name in required:
+                value = terminal_groups[name]
+                expected = groups[name][ids.to(groups[name].device)]
+                if (not isinstance(value, torch.Tensor) or value.dtype != expected.dtype
+                        or not torch.equal(value.to(expected.device), expected)):
+                    raise ValueError(f"AMP terminal {name} must equal the reward snapshot's done subset")
+        elif terminal is not None:
+            raise ValueError("AMP terminal observations were supplied without done environments")
+        return TensorDict(dict(groups), batch_size=[count])
+
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
-        disc_obs = self.amp_discriminator.get_disc_obs(obs, flatten_history_dim=False)
-        disc_demo_obs = self.amp_discriminator.get_disc_demo_obs(obs, flatten_history_dim=False)
-        # Compute the Style Reward
-        self.style_rewards, self.disc_score = self.amp_discriminator.predict_style_reward(disc_obs, dt=self.amp_cfg["step_dt"])
-        # Optional per-env style gate published by the env as an observation
-        # group named "style_gate" (shape (num_envs, 1), values in [0, 1]).
-        # E.g. Scaler-AMP-3 zeroes the style reward on standing commands so
-        # holding the default pose is governed by task rewards alone.
-        if "style_gate" in obs.keys():
-            self.style_rewards = self.style_rewards * obs["style_gate"].reshape(-1)
-            if not getattr(self, "_style_gate_announced", False):
-                print("[PPOAMP] per-env style gate enabled (obs group 'style_gate')")
-                self._style_gate_announced = True
-        # Linearly interpolate between task reward and style reward
-        self.rewards_lerp = self.amp_discriminator.lerp_reward(task_reward=rewards, style_reward=self.style_rewards)
+        reward_obs = self._reward_time_amp_obs(obs, rewards, dones, extras)
+        disc_obs = self.amp_discriminator.get_disc_obs(reward_obs, flatten_history_dim=False)
+        disc_demo_obs = self.amp_discriminator.get_disc_demo_obs(reward_obs, flatten_history_dim=False)
+        gate = reward_obs.get("style_gate")
+        task_gate = reward_obs.get("task_style_gate")
+        if "task_style_gate" in reward_obs:
+            def strict_gate(value, name, count):
+                if (value is None or value.shape != (count, 1)
+                        or not torch.isfinite(value).all()
+                        or (value < 0).any() or (value > 1).any()):
+                    raise ValueError(f"AMP {name} must be finite in [0, 1] with shape ({count}, 1)")
+                return value[:, 0].to(rewards.device).clone()
+
+            gate = strict_gate(gate, "style_gate", rewards.numel())
+            task_gate = strict_gate(task_gate, "task_style_gate", rewards.numel())
+            if (gate > task_gate).any():
+                raise ValueError("AMP requires style_gate <= task_style_gate")
+        elif gate is None:
+            gate = torch.ones_like(rewards)
+        else:
+            if gate.shape != (rewards.numel(), 1) or not torch.isfinite(gate).all():
+                raise ValueError("AMP style_gate must be finite with shape (num_envs, 1)")
+            gate = gate[:, 0].to(rewards.device).clamp(0.0, 1.0).clone()
+        terminal = extras.get("amp_terminal_observations")
+        done_ids = dones.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if done_ids.numel():
+            if terminal is None:
+                raise ValueError("AMP terminal transitions require pre-reset discriminator observations")
+            ids = terminal["env_ids"]
+            if ids.ndim != 1 or ids.dtype != torch.long:
+                raise ValueError("AMP terminal env_ids must be a 1D long tensor")
+            ids = ids.to(disc_obs.device)
+            if not torch.equal(torch.sort(ids).values, done_ids.to(ids.device)):
+                raise ValueError("AMP terminal env_ids must match done environments exactly")
+            terminal_obs = TensorDict(terminal["observations"], batch_size=[ids.numel()])
+            terminal_disc = self.amp_discriminator.get_disc_obs(terminal_obs, flatten_history_dim=False)
+            terminal_demo = self.amp_discriminator.get_disc_demo_obs(terminal_obs, flatten_history_dim=False)
+            if (terminal_disc.shape != disc_obs[ids].shape
+                    or terminal_demo.shape != disc_demo_obs[ids].shape):
+                raise ValueError("AMP terminal discriminator shape mismatch")
+            disc_obs = disc_obs.clone()
+            disc_demo_obs = disc_demo_obs.clone()
+            disc_obs[ids] = terminal_disc.to(disc_obs.device)
+            disc_demo_obs[ids] = terminal_demo.to(disc_demo_obs.device)
+            if "style_gate" in obs:
+                terminal_gate = terminal_obs.get("style_gate")
+                if task_gate is not None:
+                    terminal_gate = strict_gate(terminal_gate, "terminal style_gate", ids.numel())
+                    terminal_task_gate = strict_gate(terminal_obs.get("task_style_gate"),
+                                                     "terminal task_style_gate", ids.numel())
+                    if (terminal_gate > terminal_task_gate).any():
+                        raise ValueError("AMP terminal requires style_gate <= task_style_gate")
+                    gate[ids.to(gate.device)] = terminal_gate
+                    task_gate[ids.to(task_gate.device)] = terminal_task_gate
+                else:
+                    if (terminal_gate is None or terminal_gate.shape != (ids.numel(), 1)
+                            or not torch.isfinite(terminal_gate).all()):
+                        raise ValueError("AMP terminal style_gate must be finite with shape (num_done, 1)")
+                    gate[ids.to(gate.device)] = terminal_gate[:, 0].to(gate.device).clamp(0.0, 1.0)
+        elif terminal is not None:
+            raise ValueError("AMP terminal observations were supplied without done environments")
+        # Compute the Style Reward. Progress gates only the style bonus.
+        raw_style_rewards, self.disc_score = self.amp_discriminator.predict_style_reward(disc_obs, dt=self.amp_cfg["step_dt"])
+        if task_gate is None:
+            # Preserve the legacy arithmetic exactly when the new field is absent.
+            mixed_rewards = self.amp_discriminator.lerp_reward(task_reward=rewards, style_reward=raw_style_rewards)
+            self.rewards_lerp = gate * mixed_rewards + (1.0 - gate) * rewards
+        else:
+            # Supported commands keep the same task coefficient even at zero
+            # progress; slowing down must never restore a larger task coefficient.
+            task_component = self.amp_discriminator.lerp_reward(
+                task_reward=rewards, style_reward=torch.zeros_like(raw_style_rewards))
+            style_component = self.amp_discriminator.lerp_reward(
+                task_reward=torch.zeros_like(rewards), style_reward=raw_style_rewards)
+            self.rewards_lerp = (task_gate * task_component + (1.0 - task_gate) * rewards
+                                 + gate * style_component)
+        self.style_rewards = gate * raw_style_rewards
         # Store the un-normalized disc obs and disc demo obs into buffers
         self.disc_obs_buffer.append(disc_obs)
         self.disc_demo_obs_buffer.append(disc_demo_obs)
@@ -153,6 +422,16 @@ class PPOAMP(PPO):
         mean_disc_grad_penalty = 0
         mean_disc_score = 0
         mean_disc_demo_score = 0
+        mean_reference_anchor_loss = 0
+        mean_lateral_reference_anchor_loss = 0
+        mean_lateral_rehearsal_loss = 0
+        lateral_rehearsal_enabled = getattr(self, "lateral_rehearsal", None) is not None
+        lateral_reference_anchor_enabled = getattr(self, "lateral_reference_policy", None) is not None
+        reference_anchor_enabled = (
+            getattr(self, "reference_policy", None) is not None
+            and float(getattr(self, "reference_policy_anchor_coef", 0.0))
+            > 0.0
+        )
 
         # Get mini batch generator
         if self.policy.is_recurrent:
@@ -279,6 +558,21 @@ class PPOAMP(PPO):
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            reference_anchor_loss = self._reference_policy_anchor_loss(
+                obs_batch[:original_batch_size],
+                mu_batch,
+            )
+            if reference_anchor_loss is not None:
+                loss += reference_anchor_loss
+            lateral_reference_anchor_loss = self._lateral_reference_policy_anchor_loss(
+                obs_batch[:original_batch_size], mu_batch,
+            )
+            if lateral_reference_anchor_loss is not None:
+                loss += lateral_reference_anchor_loss
+            lateral_rehearsal_loss = self._lateral_rehearsal_loss()
+            if lateral_rehearsal_loss is not None:
+                loss += lateral_rehearsal_loss
+
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions
@@ -329,6 +623,13 @@ class PPOAMP(PPO):
 
             # AMP discriminator loss
             with torch.no_grad():
+                if self.amp_cfg.get("normalize_demo_observations", False):
+                    # Both classes and the gradient penalty use one fixed set of
+                    # statistics for this minibatch, including demonstration-only
+                    # variation that may be absent from an early policy rollout.
+                    self.amp_discriminator.update_normalization(
+                        torch.cat((disc_obs_batch, disc_demo_obs_batch), dim=0)
+                    )
                 disc_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_obs_batch) # [mini_batch_size, disc_obs_steps, disc_obs_dim]
                 disc_demo_obs_batch_normed = self.amp_discriminator.normalize_disc_obs(disc_demo_obs_batch)
             
@@ -386,9 +687,12 @@ class PPOAMP(PPO):
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
             # Apply the gradients for AMP discriminator
+            nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.disc_max_grad_norm)
             self.disc_optimizer.step()
-            # Update the AMP normalizer
-            self.amp_discriminator.update_normalization(disc_obs_batch)
+            # Preserve the historical policy-only, post-step update unless the
+            # shared policy/demo statistics were already updated above.
+            if not self.amp_cfg.get("normalize_demo_observations", False):
+                self.amp_discriminator.update_normalization(disc_obs_batch)
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -405,6 +709,12 @@ class PPOAMP(PPO):
             mean_disc_grad_penalty += disc_grad_penalty.item()
             mean_disc_score += disc_score.mean().item()
             mean_disc_demo_score += disc_demo_score.mean().item()
+            if reference_anchor_loss is not None:
+                mean_reference_anchor_loss += reference_anchor_loss.item()
+            if lateral_reference_anchor_loss is not None:
+                mean_lateral_reference_anchor_loss += lateral_reference_anchor_loss.item()
+            if lateral_rehearsal_loss is not None:
+                mean_lateral_rehearsal_loss += lateral_rehearsal_loss.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -419,6 +729,12 @@ class PPOAMP(PPO):
         mean_disc_grad_penalty /= num_updates
         mean_disc_score /= num_updates
         mean_disc_demo_score /= num_updates
+        if reference_anchor_enabled:
+            mean_reference_anchor_loss /= num_updates
+        if lateral_reference_anchor_enabled:
+            mean_lateral_reference_anchor_loss /= num_updates
+        if lateral_rehearsal_enabled:
+            mean_lateral_rehearsal_loss /= num_updates
 
         # Clear the storage
         self.storage.clear()
@@ -437,5 +753,13 @@ class PPOAMP(PPO):
         loss_dict["amp/disc_grad_penalty"] = mean_disc_grad_penalty
         loss_dict["amp/disc_score"] = mean_disc_score
         loss_dict["amp/disc_demo_score"] = mean_disc_demo_score
+        if reference_anchor_enabled:
+            loss_dict["amp/reference_policy_anchor"] = (
+                mean_reference_anchor_loss
+            )
+        if lateral_reference_anchor_enabled:
+            loss_dict["amp/lateral_reference_policy_anchor"] = mean_lateral_reference_anchor_loss
+        if lateral_rehearsal_enabled:
+            loss_dict["amp/lateral_rehearsal"] = mean_lateral_rehearsal_loss
 
         return loss_dict

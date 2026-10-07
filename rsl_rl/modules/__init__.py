@@ -6,6 +6,7 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
+from .actor_critic_film import ActorCriticFiLMCritic
 from .actor_critic_cnn import ActorCriticCNN
 from .actor_critic_encoder import Conv2dHeadModel, EncoderActorCritic
 from .actor_critic_encoder_moe import EncoderMoEActorCritic
@@ -21,6 +22,7 @@ from .amp import AMPDiscriminator, resolve_amp_config
 
 __all__ = [
     "ActorCritic",
+    "ActorCriticFiLMCritic",
     "ActorCriticCNN",
     "Conv2dHeadModel",
     "EncoderActorCritic",

@@ -28,6 +28,8 @@ class AMPDiscriminator(nn.Module):
             style_reward_scale=1.0, 
             task_style_lerp=0.0,
             device="cpu",
+            excluded_feature_indices=None,
+            normalization_std_floor=None,
         ):
         super().__init__()
         
@@ -41,6 +43,21 @@ class AMPDiscriminator(nn.Module):
         self.task_style_lerp = task_style_lerp
         self.device = device
         self.loss_type = loss_type
+        # Opt-in observation semantics. Nonpersistent buffers follow .to()
+        # without changing historical discriminator state_dict keys.
+        indices = tuple(() if excluded_feature_indices is None else excluded_feature_indices)
+        if (any(type(i) is not int or not 0 <= i < disc_obs_dim for i in indices)
+                or len(set(indices)) != len(indices)):
+            raise ValueError("excluded_feature_indices must be unique in-range integers")
+        self.excluded_feature_indices = tuple(sorted(indices))
+        self.register_buffer("_excluded_indices", torch.tensor(self.excluded_feature_indices,
+                             dtype=torch.long, device=device), persistent=False)
+        floor = None
+        if normalization_std_floor is not None:
+            floor = torch.as_tensor(normalization_std_floor, dtype=torch.float32, device=device).detach().clone()
+            if floor.shape != (disc_obs_dim,) or not torch.isfinite(floor).all() or not (floor > 0).all():
+                raise ValueError("normalization_std_floor must contain one finite positive physical scale per feature")
+        self.register_buffer("_normalization_std_floor", floor, persistent=False)
         
         # Discriminator observation normalizer
         self.disc_obs_normalizer = EmpiricalNormalization(shape=self.disc_obs_dim, until=1e8).to(device)
@@ -75,6 +92,19 @@ class AMPDiscriminator(nn.Module):
         h = self.disc_trunk(x)
         d = self.disc_linear(h)
         return d
+
+    def feature_contract(self) -> dict:
+        """Serializable configuration; weights alone do not specify semantics."""
+        return {"excluded_feature_indices": list(self.excluded_feature_indices),
+                "normalization_std_floor": None if self._normalization_std_floor is None
+                else self._normalization_std_floor.detach().cpu().tolist()}
+
+    def _mask_features(self, observations: torch.Tensor) -> torch.Tensor:
+        if not self.excluded_feature_indices:
+            return observations
+        result = observations.clone()
+        result.index_fill_(-1, self._excluded_indices, 0.0)
+        return result
     
     def get_disc_obs(self, obs: TensorDict, flatten_history_dim: bool = False) -> torch.Tensor:
         disc_obs_list = []
@@ -90,6 +120,7 @@ class AMPDiscriminator(nn.Module):
 
             disc_obs_list.append(obs_tensor)
         disc_obs = torch.cat(disc_obs_list, dim=-1)  # [num_envs, disc_obs_steps, disc_obs_dim]
+        disc_obs = self._mask_features(disc_obs)
         if flatten_history_dim:
             disc_obs = disc_obs.view(num_envs, -1)  # [num_envs, disc_obs_steps * disc_obs_dim]
         return disc_obs
@@ -108,6 +139,7 @@ class AMPDiscriminator(nn.Module):
 
             disc_demo_obs_list.append(obs_tensor)
         disc_demo_obs = torch.cat(disc_demo_obs_list, dim=-1)  #[num_envs, disc_obs_steps, disc_obs_dim]
+        disc_demo_obs = self._mask_features(disc_demo_obs)
         if flatten_history_dim:
             disc_demo_obs = disc_demo_obs.reshape(num_envs, -1)  # [num_envs, disc_obs_steps * disc_obs_dim]
         return disc_demo_obs
@@ -116,8 +148,17 @@ class AMPDiscriminator(nn.Module):
         assert len(disc_obs.shape) == 3, "Discriminator observations must be a 3D tensor (num_envs, disc_obs_steps, disc_obs_dim)."
         assert self.disc_obs_dim == disc_obs.shape[2], f"Discriminator observation dimension mismatch. Expected {self.disc_obs_dim}, got {disc_obs.shape[2]}."
         assert self.disc_obs_steps == disc_obs.shape[1], f"Discriminator observation steps mismatch. Expected {self.disc_obs_steps}, got {disc_obs.shape[1]}."
-        disc_obs_reshaped = disc_obs.reshape(-1, self.disc_obs_dim)  # [num_envs * disc_obs_steps, disc_obs_dim]
-        normed_disc_obs = self.disc_obs_normalizer(disc_obs_reshaped)
+        disc_obs_reshaped = self._mask_features(disc_obs).reshape(-1, self.disc_obs_dim)
+        if self._normalization_std_floor is None:
+            normed_disc_obs = self.disc_obs_normalizer(disc_obs_reshaped)
+        else:
+            normalizer = self.disc_obs_normalizer
+            # Preserve EmpiricalNormalization's additive epsilon semantics:
+            # floor the physical standard deviation, then add epsilon.
+            denominator = torch.maximum(normalizer.std, self._normalization_std_floor) + normalizer.eps
+            normed_disc_obs = (disc_obs_reshaped - normalizer.mean) / denominator
+        # Keep excluded channels zero even if a caller loaded old statistics.
+        normed_disc_obs = self._mask_features(normed_disc_obs)
         normed_disc_obs = normed_disc_obs.reshape(-1, self.disc_obs_steps, self.disc_obs_dim)  # [num_envs, disc_obs_steps, disc_obs_dim]
         return normed_disc_obs
     
@@ -130,7 +171,7 @@ class AMPDiscriminator(nn.Module):
         assert len(disc_obs.shape) == 3, "Discriminator observations must be a 3D tensor (num_envs, disc_obs_steps, disc_obs_dim)."
         assert self.disc_obs_dim == disc_obs.shape[2], f"Discriminator observation dimension mismatch. Expected {self.disc_obs_dim}, got {disc_obs.shape[2]}."
         assert self.disc_obs_steps == disc_obs.shape[1], f"Discriminator observation steps mismatch. Expected {self.disc_obs_steps}, got {disc_obs.shape[1]}."
-        disc_obs_reshaped = disc_obs.reshape(-1, self.disc_obs_dim)  # [num_envs * disc_obs_steps, disc_obs_dim]
+        disc_obs_reshaped = self._mask_features(disc_obs).reshape(-1, self.disc_obs_dim)
         self.disc_obs_normalizer.update(disc_obs_reshaped)
 
     def compute_grad_penalty(self, demo_data: torch.Tensor, scale=10):
@@ -172,9 +213,7 @@ class AMPDiscriminator(nn.Module):
             self.eval()
             
             # Normalize the input data
-            disc_obs_reshaped = disc_obs.view(-1, self.disc_obs_dim)  # [num_envs * disc_obs_steps, disc_obs_dim]
-            normed_disc_obs = self.disc_obs_normalizer(disc_obs_reshaped)
-            normed_disc_obs = normed_disc_obs.view(-1, self.disc_obs_steps * self.disc_obs_dim)  # [num_envs, disc_obs_steps * disc_obs_dim]
+            normed_disc_obs = self.normalize_disc_obs(disc_obs).reshape(-1, self.input_dim)
         
             disc_score = self.forward(normed_disc_obs)  # [num_envs, 1]
             

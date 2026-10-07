@@ -316,6 +316,16 @@ class Logger:
         if self.writer and not self.disable_logs and self.logger_type in ["neptune", "wandb"]:
             self.writer.save_model(path, it)
 
+    def close(self) -> None:
+        """Flush local metrics and stop any external logging session."""
+        if self.writer is None:
+            return
+        self.writer.flush()
+        stop = getattr(self.writer, "stop", None)
+        if callable(stop):
+            stop()
+        self.writer.close()
+
     def _prepare_logging_writer(self) -> None:
         """Prepare the logging writer, which can be either Tensorboard, W&B or Neptune."""
         if self.log_dir is not None and not self.disable_logs:
